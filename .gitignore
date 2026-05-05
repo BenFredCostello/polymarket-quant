@@ -1,0 +1,13 @@
+# Ignore everything
+*
+
+# Un-ignore Python files
+!*.py
+!**/*.py
+
+# Un-ignore directories (needed to traverse into them)
+!*/
+
+# Un-ignore project files
+!README.md
+!.gitignore
