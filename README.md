@@ -1,14 +1,11 @@
 # Polymarket Crypto Binary Options — Quant Trading System
 
-# My Notes
-Seems to poll like every 5 min getting like the averages of past data, inefficient need to fix.
-
 A systematic trading strategy for Polymarket crypto binary options, combining options pricing theory with portfolio-aware bet sizing.
 
 ## Structure
 
 ```
-polymarket_quant/
+polymarket/
 ├── data/
 │   ├── fetch_crypto.py        # yfinance pipeline + realised vol
 │   └── fetch_polymarket.py    # Polymarket CLOB/Gamma API client
@@ -22,10 +19,10 @@ polymarket_quant/
 │   └── kelly.py               # Correlation-adjusted fractional Kelly
 ├── execution/
 │   └── trader.py              # Live market scanner + bet placement
-└── notebooks/
-    ├── 01_exploration.ipynb
-    ├── 02_pricing_validation.ipynb
-    └── 03_backtest_results.ipynb
+├── backtest.py                # Full backtest engine
+├── tracker.py                 # Position tracker
+├── run.py                     # Main entry point
+└── config.py                  # Central configuration
 ```
 
 ## Setup
@@ -35,14 +32,25 @@ pip install yfinance numpy scipy pandas matplotlib plotly requests
 pip install py-clob-client   # for live execution only
 ```
 
-## Run Component Checks
+## Usage
+
+Run the full system:
 
 ```bash
-cd polymarket_quant
-python -m execution.trader --validate
+python run.py
 ```
 
-This runs all validation tests across every module.
+Run validation checks across all modules:
+
+```bash
+python run_checks.py
+```
+
+Run the backtest:
+
+```bash
+python backtest.py
+```
 
 ## Individual Module Tests
 
@@ -54,12 +62,6 @@ python -m analysis.correlation       # validate + correlation matrix demo
 python -m sizing.kelly               # validate + portfolio sizing demo
 python -m data.fetch_crypto          # pull live BTC/ETH/SOL data
 python -m data.fetch_polymarket      # pull live Polymarket markets
-```
-
-## Paper Trading
-
-```bash
-python -m execution.trader --paper
 ```
 
 ## Architecture
@@ -76,8 +78,8 @@ python -m execution.trader --paper
 
 ## Key Design Decisions
 
-**Why fractional Kelly (25%)?**  
-Model uncertainty is real. Our vol input is realised vol, not implied — the market may be pricing information we don't have. 1/4 Kelly dramatically reduces drawdown in adverse scenarios while capturing most of the EV.
+**Why fractional Kelly (30%)?**  
+Model uncertainty is real. Our vol input is realised vol, not implied — the market may be pricing information we don't have. Fractional Kelly dramatically reduces drawdown in adverse scenarios while capturing most of the EV.
 
 **Why Jump Diffusion over BS?**  
 Crypto exhibits fat tails and gap behaviour (exchange hacks, regulatory events, liquidation cascades). BS systematically underprices OTM options. The fat tail premium from MC is informative — large BS/MC divergence signals high model risk.
