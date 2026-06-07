@@ -38,3 +38,6 @@ CORR_THRESHOLD             = 0.75     # correlation above which penalty is appli
 JUMP_LAM                   = 8.0      # jump intensity (jumps per year)
 JUMP_MU_J                  = -0.04   # mean log-jump size
 JUMP_SIGMA_J               = 0.12    # std dev of log-jump size
+
+# ── performance / reporting ───────────────────────────────────────────────────
+RISK_FREE_RATE             = 0.045   # annualised risk-free rate (US 3-month T-bill approx)

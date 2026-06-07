@@ -5,9 +5,10 @@ Persistent trade tracking (JSON) and Excel export for Polymarket bets.
 """
 
 import json
+import math
 import uuid
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import requests
@@ -17,6 +18,11 @@ logger = logging.getLogger(__name__)
 TRADES_FILE = Path(__file__).parent / "trades.json"
 EXCEL_FILE  = Path(__file__).parent / "polymarket_trades.xlsx"
 STARTING_BANKROLL = 1_000.0
+
+try:
+    from config import RISK_FREE_RATE
+except ImportError:
+    RISK_FREE_RATE = 0.045
 
 
 # ── Persistence ───────────────────────────────────────────────────────────────
@@ -204,6 +210,41 @@ def get_portfolio_stats(trades: list[dict], starting_bankroll: float) -> dict:
     losses       = [t for t in resolved if t["status"] == "LOST"]
     total_pnl    = sum(t["pnl"] for t in resolved)
 
+    # Annualised Sharpe: build daily equity curve, compute daily returns,
+    # then Sharpe = (mean_daily - rf/365) / std_daily * sqrt(365)
+    sharpe = None
+    resolved_dated = sorted(
+        [t for t in resolved if t.get("date_resolved")],
+        key=lambda t: t["date_resolved"],
+    )
+    if len(resolved_dated) >= 2:
+        date_equity: dict[str, float] = {}
+        running = starting_bankroll
+        for t in resolved_dated:
+            running += t["pnl"]
+            date_equity[str(t["date_resolved"])[:10]] = running
+
+        dates = sorted(date_equity)
+        start = datetime.strptime(dates[0],  "%Y-%m-%d").date()
+        end   = datetime.strptime(dates[-1], "%Y-%m-%d").date()
+        n_days = (end - start).days + 1
+
+        daily_vals, prev = [], starting_bankroll
+        for i in range(n_days):
+            d = (start + timedelta(days=i)).strftime("%Y-%m-%d")
+            prev = date_equity.get(d, prev)
+            daily_vals.append(prev)
+
+        if len(daily_vals) >= 3:
+            rets = [(daily_vals[i] - daily_vals[i-1]) / daily_vals[i-1]
+                    for i in range(1, len(daily_vals))]
+            n    = len(rets)
+            mean = sum(rets) / n
+            std  = (sum((r - mean) ** 2 for r in rets) / (n - 1)) ** 0.5
+            if std > 0:
+                daily_rf = RISK_FREE_RATE / 365
+                sharpe   = (mean - daily_rf) / std * (365 ** 0.5)
+
     return {
         "starting_bankroll": starting_bankroll,
         "net_value":         starting_bankroll + total_pnl,
@@ -216,6 +257,8 @@ def get_portfolio_stats(trades: list[dict], starting_bankroll: float) -> dict:
         "wins":              len(wins),
         "losses":            len(losses),
         "at_risk":           sum(t["stake_usd"] for t in open_trades),
+        "sharpe":            sharpe,
+        "sharpe_n_days":     n_days if sharpe is not None else None,
     }
 
 
@@ -336,17 +379,27 @@ def export_excel() -> Path:
     pnl_color = _C["win_fg"] if stats["total_pnl"] >= 0 else _C["loss_fg"]
     roi_color = pnl_color
 
-    _metric("Starting Bankroll",     starting_bankroll,    '"$"#,##0.00')
-    _metric("Current Portfolio Value", stats["net_value"], '"$"#,##0.00')
-    _metric("Total P&L",             stats["total_pnl"],   '"$"+#,##0.00;"$"-#,##0.00', pnl_color)
-    _metric("Total Return",          stats["roi"],          '"+0.0%";"-0.0%"',           roi_color)
+    _metric("Starting Bankroll",       starting_bankroll,      '"$"#,##0.00')
+    _metric("Current Portfolio Value", stats["net_value"],    '"$"#,##0.00')
+    _metric("Total P&L",               stats["total_pnl"],   '"$"+#,##0.00;"$"-#,##0.00', pnl_color)
+    _metric("Total Return",            stats["roi"],          '0.0%;-0.0%',                roi_color)
     _metric("Win Rate",
             stats["win_rate"] if stats["resolved_bets"] else "—",
             '0.0%' if stats["resolved_bets"] else None)
-    _metric("Wins / Losses",         f"{stats['wins']} / {stats['losses']}")
-    _metric("Total Bets Placed",     stats["total_bets"])
-    _metric("Open Positions",        stats["open_bets"])
-    _metric("Capital at Risk",       stats["at_risk"],      '"$"#,##0.00')
+    _metric("Wins / Losses",           f"{stats['wins']} / {stats['losses']}")
+    _metric("Total Bets Placed",       stats["total_bets"])
+    _metric("Open Positions",          stats["open_bets"])
+    _metric("Capital at Risk",         stats["at_risk"],      '"$"#,##0.00')
+    _metric("Risk-Free Rate",          RISK_FREE_RATE,        '0.00%')
+
+    sharpe      = stats.get("sharpe")
+    sharpe_days = stats.get("sharpe_n_days")
+    sharpe_label = (
+        f"Sharpe ratio ({sharpe_days}d, annualised)"
+        if sharpe_days else "Sharpe Ratio"
+    )
+    sharpe_val = round(sharpe, 2) if sharpe is not None else "—"
+    _metric(sharpe_label, sharpe_val)
 
     row += 1
 
@@ -369,9 +422,10 @@ def export_excel() -> Path:
     row += 1
 
     eq_data_start = row
-    # Seed row (starting point, before any trades resolve)
+
+    # Seed row
     seed_date = resolved_sorted[0]["date_resolved"] if resolved_sorted else datetime.now().strftime("%Y-%m-%d")
-    ws.cell(row=row, column=1, value=seed_date)
+    ws.cell(row=row, column=1, value=str(seed_date)[:10])
     ws.cell(row=row, column=2, value=starting_bankroll).number_format = '"$"#,##0.00'
     ws.row_dimensions[row].height = 18
     row += 1
@@ -379,7 +433,7 @@ def export_excel() -> Path:
     running = starting_bankroll
     for t in resolved_sorted:
         running += t["pnl"]
-        ws.cell(row=row, column=1, value=t["date_resolved"])
+        ws.cell(row=row, column=1, value=str(t["date_resolved"])[:10])
         c = ws.cell(row=row, column=2, value=running)
         c.number_format = '"$"#,##0.00'
         ws.row_dimensions[row].height = 18
@@ -389,18 +443,59 @@ def export_excel() -> Path:
 
     # Chart (only if we have data)
     if eq_data_end > eq_data_start:
+        from openpyxl.chart.marker import Marker
+
         chart = LineChart()
         chart.title  = "Portfolio Net Value Over Time"
         chart.style  = 10
         chart.height = 14
         chart.width  = 26
-        chart.y_axis.title = "Net Value ($)"
 
-        values = Reference(ws, min_col=2, min_row=eq_data_start, max_row=eq_data_end)
-        chart.add_data(values, titles_from_data=False)
-        chart.series[0].title = SeriesLabel(v="Net Value")
-        chart.series[0].graphicalProperties.line.solidFill = _C["accent_bg"]
-        chart.series[0].graphicalProperties.line.width     = 25000
+        values = Reference(ws, min_col=2, min_row=eq_data_start - 1, max_row=eq_data_end)
+        dates  = Reference(ws, min_col=1, min_row=eq_data_start,     max_row=eq_data_end)
+        from openpyxl.chart.title import Title
+        from openpyxl.drawing.text import RichTextProperties, Paragraph, RegularTextRun, CharacterProperties
+
+        chart.add_data(values, titles_from_data=True, from_rows=False)
+        chart.set_categories(dates)
+
+        chart.x_axis.delete = False
+        chart.y_axis.delete = False
+
+        # Nice y-axis bounds: round data min/max to a clean step, one step of padding each side
+        eq_values = [
+            ws.cell(row=r, column=2).value
+            for r in range(eq_data_start, eq_data_end + 1)
+            if ws.cell(row=r, column=2).value is not None
+        ]
+        if eq_values:
+            v_min, v_max = min(eq_values), max(eq_values)
+            step = 50
+            y_min = math.floor(v_min / step) * step - step
+            y_max = math.ceil(v_max  / step) * step + step
+            chart.y_axis.scaling.min = float(y_min)
+            chart.y_axis.scaling.max = float(y_max)
+            chart.y_axis.majorUnit   = float(step)
+
+        t = Title()
+        para = Paragraph()
+        run = RegularTextRun()
+        run.rPr = CharacterProperties(sz=1300, b=True)
+        run.t = "Portfolio Net Value Over Time"
+        para.r.append(run)
+        t.tx.rich.bodyPr = RichTextProperties()
+        t.tx.rich.p = [para]
+        t.overlay = False
+        chart.title = t
+
+        s = chart.series[0]
+        s.graphicalProperties.line.solidFill = _C["accent_bg"]
+        s.graphicalProperties.line.width     = 25000
+        s.marker = Marker(symbol="circle", size=4)
+        s.marker.graphicalProperties.solidFill             = _C["accent_bg"]
+        s.marker.graphicalProperties.line.solidFill        = _C["accent_bg"]
+
+        chart.legend = None
 
         ws.add_chart(chart, f"D{chart_anchor_row}")
 
@@ -581,5 +676,13 @@ def export_excel() -> Path:
         c.number_format = '"$"#,##0.00'
         c.font          = _font(bold=True, size=10)
 
-    wb.save(EXCEL_FILE)
-    return EXCEL_FILE
+    import time
+    for attempt in range(5):
+        try:
+            wb.save(EXCEL_FILE)
+            return EXCEL_FILE
+        except PermissionError:
+            if attempt < 4:
+                time.sleep(2)
+            else:
+                raise
