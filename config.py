@@ -33,6 +33,7 @@ MIN_EDGE                   = 0.005     # min probability edge required to place 
 MAX_POSITION               = 0.15     # max fraction of bankroll on any single bet
 MAX_EDGE                   = 0.2     # edges above this are skipped as near-expiry/vol artifacts
 CORR_THRESHOLD             = 0.75     # correlation above which penalty is applied
+MIN_STAKE_USD              = 1.0      # minimum bet size in dollars
 
 # ── monte_carlo / jump diffusion ──────────────────────────────────────────────
 JUMP_LAM                   = 8.0      # jump intensity (jumps per year)

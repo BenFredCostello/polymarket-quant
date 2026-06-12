@@ -21,6 +21,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import pandas as pd
 from sizing.kelly import DEFAULT_MIN_EDGE, DEFAULT_KELLY_FRACTION, DEFAULT_MAX_POSITION
+try:
+    from config import MIN_STAKE_USD
+except ImportError:
+    MIN_STAKE_USD = 1.0
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -288,6 +292,10 @@ class LiveTrader:
                 max_position=self.max_position,
             )
 
+            stake_usd = sizing.final_stake * self.bankroll
+            if sizing.should_bet:
+                stake_usd = max(stake_usd, MIN_STAKE_USD)
+
             signal = TradeSignal(
                 condition_id=market.condition_id,
                 question=market.question[:80],
@@ -300,7 +308,7 @@ class LiveTrader:
                 edge_bs=bs_p - market_prob,
                 edge_mc=mc_p - market_prob,
                 recommended_stake_frac=sizing.final_stake,
-                recommended_stake_usd=sizing.final_stake * self.bankroll,
+                recommended_stake_usd=stake_usd,
                 corr_penalty=corr_pen,
                 volume_total=market.volume,
                 volume_24h=market.volume24hr,

@@ -72,15 +72,12 @@ def record_bet(signal, yes_token: str = "") -> dict:
 
 def _extract_yes_price(m: dict) -> float | None:
     """Pull YES price from a Gamma API market dict using multiple fallback methods."""
-    # Method 1: tokens array
     for t in m.get("tokens", []):
         if t.get("outcome", "").upper() == "YES":
             try:
                 return float(t["price"])
             except (KeyError, ValueError, TypeError):
                 pass
-
-    # Method 2: outcomePrices + outcomes JSON strings
     op = m.get("outcomePrices")
     oc = m.get("outcomes")
     if op and oc:
@@ -92,25 +89,31 @@ def _extract_yes_price(m: dict) -> float | None:
                     return float(price)
         except Exception:
             pass
-
-    # Method 3: bid/ask midpoint
     bid = m.get("bestBid")
     ask = m.get("bestAsk")
     if bid is not None and ask is not None:
         return (float(bid) + float(ask)) / 2
-
     return None
 
 
-def _check_resolution(condition_id: str, yes_token: str) -> tuple[bool, str | None]:
+def _check_resolution(condition_id: str, expiry: str = "") -> tuple[bool, str | None]:
     """
     Returns (is_resolved, outcome) where outcome is "YES", "NO", or None.
-    Tries Gamma API first, then CLOB price history as fallback.
+    Before expiry: only the API's resolved flag is trusted (avoids settling on
+    a high market price that could still reverse before the event date).
+    After expiry: price check (>=0.95 / <=0.05) is used as a fallback when the
+    API's resolved flag isn't set.
     """
     GAMMA = "https://gamma-api.polymarket.com"
-    CLOB  = "https://clob.polymarket.com"
 
-    # --- Method 1: Gamma API by conditionId ---
+    past_expiry = False
+    if expiry:
+        try:
+            exp_dt = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+            past_expiry = datetime.now(timezone.utc) > exp_dt
+        except Exception:
+            pass
+
     for param_key in ("conditionId", "id"):
         try:
             resp = requests.get(
@@ -123,33 +126,19 @@ def _check_resolution(condition_id: str, yes_token: str) -> tuple[bool, str | No
                 markets = data if isinstance(data, list) else data.get("markets", [])
                 if markets:
                     m = markets[0]
-                    yes_p = _extract_yes_price(m)
-                    if yes_p is not None:
-                        if yes_p >= 0.99:
-                            return True, "YES"
-                        if yes_p <= 0.01:
-                            return True, "NO"
+                    if m.get("resolved"):
+                        result = str(m.get("result", "")).upper()
+                        if result in ("YES", "NO"):
+                            return True, result
+                    if past_expiry:
+                        yes_p = _extract_yes_price(m)
+                        if yes_p is not None:
+                            if yes_p >= 0.95:
+                                return True, "YES"
+                            if yes_p <= 0.05:
+                                return True, "NO"
         except Exception as e:
             logger.debug(f"Gamma resolution check failed ({param_key}={condition_id[:20]}): {e}")
-
-    # --- Method 2: CLOB prices-history (latest data point) ---
-    if yes_token:
-        try:
-            resp = requests.get(
-                f"{CLOB}/prices-history",
-                params={"market": yes_token, "interval": "max", "fidelity": 1440},
-                timeout=15,
-            )
-            if resp.status_code == 200:
-                history = resp.json().get("history", [])
-                if history:
-                    latest_price = float(max(history, key=lambda h: int(h["t"]))["p"])
-                    if latest_price >= 0.99:
-                        return True, "YES"
-                    if latest_price <= 0.01:
-                        return True, "NO"
-        except Exception as e:
-            logger.debug(f"CLOB resolution check failed for token {yes_token[:20]}: {e}")
 
     return False, None
 
@@ -168,13 +157,26 @@ def check_resolutions() -> list[dict]:
     for trade in open_trades:
         try:
             is_resolved, resolved_outcome = _check_resolution(
-                trade["condition_id"], trade.get("yes_token", "")
+                trade["condition_id"], trade.get("expiry", "")
             )
         except Exception as e:
             logger.warning(f"Resolution check error for {trade['id']}: {e}")
             continue
 
         if not is_resolved:
+            # Auto-close any bet whose expiry has already passed
+            expiry_str = trade.get("expiry", "")
+            if expiry_str:
+                try:
+                    exp_dt = datetime.fromisoformat(expiry_str.replace("Z", "+00:00"))
+                    if datetime.now(timezone.utc) >= exp_dt:
+                        trade["status"]        = "UNRESOLVED"
+                        trade["outcome"]       = None
+                        trade["pnl"]           = 0.0
+                        trade["date_resolved"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                        newly_resolved.append(trade)
+                except Exception:
+                    pass
             continue
 
         stake      = trade["stake_usd"]
@@ -206,6 +208,7 @@ def check_resolutions() -> list[dict]:
 def get_portfolio_stats(trades: list[dict], starting_bankroll: float) -> dict:
     resolved     = [t for t in trades if t["status"] in ("WON", "LOST")]
     open_trades  = [t for t in trades if t["status"] == "OPEN"]
+    unresolved   = [t for t in trades if t["status"] == "UNRESOLVED"]
     wins         = [t for t in resolved if t["status"] == "WON"]
     losses       = [t for t in resolved if t["status"] == "LOST"]
     total_pnl    = sum(t["pnl"] for t in resolved)
@@ -254,6 +257,7 @@ def get_portfolio_stats(trades: list[dict], starting_bankroll: float) -> dict:
         "total_bets":        len(trades),
         "resolved_bets":     len(resolved),
         "open_bets":         len(open_trades),
+        "unresolved_bets":   len(unresolved),
         "wins":              len(wins),
         "losses":            len(losses),
         "at_risk":           sum(t["stake_usd"] for t in open_trades),
@@ -273,9 +277,11 @@ _C = {
     "win_bg":     "D5F5E3",
     "loss_bg":    "FADBD8",
     "open_bg":    "FEF9E7",
-    "win_fg":     "1E8449",
-    "loss_fg":    "C0392B",
-    "muted":      "7F8C8D",
+    "win_fg":          "1E8449",
+    "loss_fg":         "C0392B",
+    "muted":           "7F8C8D",
+    "unresolved_bg":   "D5D8DC",
+    "unresolved_fg":   "5D6D7E",
 }
 
 
@@ -283,10 +289,9 @@ def export_excel() -> Path:
     """Generate/refresh the Excel workbook from persisted trade history."""
     try:
         import openpyxl
-        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.styles import Font, PatternFill, Alignment
         from openpyxl.utils import get_column_letter
         from openpyxl.chart import LineChart, Reference
-        from openpyxl.chart.series import SeriesLabel
     except ImportError:
         print("  openpyxl not installed — run: pip install openpyxl")
         return None
@@ -389,6 +394,7 @@ def export_excel() -> Path:
     _metric("Wins / Losses",           f"{stats['wins']} / {stats['losses']}")
     _metric("Total Bets Placed",       stats["total_bets"])
     _metric("Open Positions",          stats["open_bets"])
+    _metric("Unresolved (expired)",    stats["unresolved_bets"])
     _metric("Capital at Risk",         stats["at_risk"],      '"$"#,##0.00')
     _metric("Risk-Free Rate",          RISK_FREE_RATE,        '0.00%')
 
@@ -526,13 +532,11 @@ def export_excel() -> Path:
     ws2.row_dimensions[1].height = 26
     ws2.freeze_panes = "A2"
 
-    # Sort: most recent first; open positions at top
+    # Sort by expiry date descending — soonest/future expiry at top, oldest at bottom
     all_sorted = sorted(
         trades,
-        key=lambda t: (
-            0 if t["status"] == "OPEN" else 1,
-            -int((t.get("date_resolved") or t.get("date_placed") or "0").replace("-", "") or 0),
-        ),
+        key=lambda t: t.get("expiry") or "",
+        reverse=True,
     )
 
     # Build cumulative P&L map (keyed by trade id, value = running pnl after this trade)
@@ -551,6 +555,9 @@ def export_excel() -> Path:
         if status in ("WON", "LOST"):
             net_val = starting_bankroll + cumulative.get(trade["id"], running)
             row_bg  = _C["win_bg"] if status == "WON" else _C["loss_bg"]
+        elif status == "UNRESOLVED":
+            net_val = current_net
+            row_bg  = _C["unresolved_bg"]
         else:
             net_val = current_net
             row_bg  = _C["open_bg"]
@@ -587,10 +594,11 @@ def export_excel() -> Path:
         ws2.cell(row=r, column=13).number_format = '"$"#,##0.00'
 
         if pnl is not None:
-            ws2.cell(row=r, column=12).font = _font(
-                color=_C["win_fg"] if pnl >= 0 else _C["loss_fg"],
-                bold=True, size=10,
-            )
+            if status == "UNRESOLVED":
+                pnl_color = _C["unresolved_fg"]
+            else:
+                pnl_color = _C["win_fg"] if pnl >= 0 else _C["loss_fg"]
+            ws2.cell(row=r, column=12).font = _font(color=pnl_color, bold=True, size=10)
 
         ws2.row_dimensions[r].height = 20
 

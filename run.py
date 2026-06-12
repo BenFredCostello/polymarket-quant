@@ -83,6 +83,16 @@ def prompt_and_record(bets: list, bankroll: float) -> float:
     if not bets:
         return bankroll
 
+    # Drop any market already in an open position
+    data = _load()
+    open_cids = {t["condition_id"] for t in data["trades"] if t["status"] == "OPEN"}
+    already_open = [b for b in bets if b.condition_id in open_cids]
+    bets = [b for b in bets if b.condition_id not in open_cids]
+    if already_open:
+        print(f"  Skipped {len(already_open)} opportunit{'y' if len(already_open) == 1 else 'ies'} already in open positions.")
+    if not bets:
+        return bankroll
+
     _section("Bet opportunities")
     for i, sig in enumerate(bets, 1):
         model_prob = (sig.model_prob_bs + sig.model_prob_mc) / 2
@@ -171,9 +181,10 @@ def main():
         return
 
     # ── Step 2: Scan ───────────────────────────────────────────────────────────
-    # Available capital = current net value minus capital locked in open bets
+    # Kelly sizes on total portfolio value (the correct wealth basis).
+    # Available capital (liquid cash) is tracked separately for affordability checks.
     available = max(stats["net_value"] - stats["at_risk"], 0)
-    bets      = run_scan(bankroll=available)
+    bets      = run_scan(bankroll=stats["net_value"])
 
     # ── Step 3: Record bets ────────────────────────────────────────────────────
     prompt_and_record(bets, bankroll=available)
