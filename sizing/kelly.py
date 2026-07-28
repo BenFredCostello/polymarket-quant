@@ -25,7 +25,7 @@ _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _root not in sys.path:
     sys.path.insert(0, _root)
 
-from config import KELLY_FRACTION, MIN_EDGE, MAX_EDGE, MAX_POSITION, CORR_THRESHOLD
+from config import KELLY_FRACTION, MIN_EDGE, MAX_EDGE, MAX_POSITION, CORR_THRESHOLD, MAX_PAYOUT
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +34,7 @@ DEFAULT_MIN_EDGE       = MIN_EDGE
 DEFAULT_MAX_EDGE       = MAX_EDGE
 DEFAULT_MAX_POSITION   = MAX_POSITION
 DEFAULT_CORR_THRESHOLD = CORR_THRESHOLD
+DEFAULT_MAX_PAYOUT     = MAX_PAYOUT
 
 
 @dataclass
@@ -90,6 +91,7 @@ def size_bet(
     min_edge: float = DEFAULT_MIN_EDGE,
     max_edge: float = DEFAULT_MAX_EDGE,
     max_position: float = DEFAULT_MAX_POSITION,
+    max_payout: float = DEFAULT_MAX_PAYOUT,
     title: str = "",
     side: str = "YES",
     pricing_date: str = "",
@@ -128,8 +130,10 @@ def size_bet(
     # Apply correlation penalty
     f_adj = f_fractional * corr_penalty
 
-    # Cap at max_position, floor at 0 (never short)
-    final_stake = float(np.clip(f_adj, 0.0, max_position))
+    # Cap at max_position and payout cap, floor at 0 (never short)
+    # payout cap: stake × b ≤ max_payout → stake ≤ max_payout / b
+    payout_cap_stake = max_payout / b
+    final_stake = float(np.clip(f_adj, 0.0, min(max_position, payout_cap_stake)))
 
     should_bet = (edge >= min_edge) and (edge <= max_edge) and (f_raw > 0)
     reasoning = _build_reasoning(edge, f_raw, f_fractional, corr_penalty, final_stake, min_edge, max_edge)
@@ -168,6 +172,7 @@ def size_portfolio(
     kelly_fraction: float = DEFAULT_KELLY_FRACTION,
     min_edge: float = DEFAULT_MIN_EDGE,
     max_position: float = DEFAULT_MAX_POSITION,
+    max_payout: float = DEFAULT_MAX_PAYOUT,
     corr_threshold: float = DEFAULT_CORR_THRESHOLD,
 ) -> list[BetSizing]:
     """
@@ -202,6 +207,7 @@ def size_portfolio(
             kelly_fraction=kelly_fraction,
             min_edge=min_edge,
             max_position=max_position,
+            max_payout=max_payout,
         )
         results.append(sizing)
 
@@ -268,7 +274,7 @@ def backtest_sizing(
             current_price=bet.get("current_price"),
             sigma=bet.get("sigma"),
             **{k: v for k, v in kelly_kwargs.items()
-               if k in ("kelly_fraction", "min_edge", "max_edge", "max_position")},
+               if k in ("kelly_fraction", "min_edge", "max_edge", "max_position", "max_payout")},
         )
 
         if not sizing.should_bet:

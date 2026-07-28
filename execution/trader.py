@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import pandas as pd
-from sizing.kelly import DEFAULT_MIN_EDGE, DEFAULT_KELLY_FRACTION, DEFAULT_MAX_POSITION
+from sizing.kelly import DEFAULT_MIN_EDGE, DEFAULT_KELLY_FRACTION, DEFAULT_MAX_POSITION, DEFAULT_MAX_PAYOUT
 try:
     from config import MIN_STAKE_USD
 except ImportError:
@@ -84,6 +84,7 @@ class LiveTrader:
         min_edge: float = DEFAULT_MIN_EDGE,
         kelly_fraction: float = DEFAULT_KELLY_FRACTION,
         max_position: float = DEFAULT_MAX_POSITION,
+        max_payout: float = DEFAULT_MAX_PAYOUT,
         paper_trade: bool = PAPER_TRADE,
         min_volume_24h: float = MIN_VOLUME_24H,
         min_volume_total: float = MIN_VOLUME_TOTAL,
@@ -92,6 +93,7 @@ class LiveTrader:
         self.min_edge = min_edge
         self.kelly_fraction = kelly_fraction
         self.max_position = max_position
+        self.max_payout = max_payout
         self.paper_trade = paper_trade
         self.min_volume_24h = min_volume_24h
         self.min_volume_total = min_volume_total
@@ -290,6 +292,7 @@ class LiveTrader:
                 kelly_fraction=self.kelly_fraction,
                 min_edge=self.min_edge,
                 max_position=self.max_position,
+                max_payout=self.max_payout,
             )
 
             stake_usd = sizing.final_stake * self.bankroll

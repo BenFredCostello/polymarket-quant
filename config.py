@@ -32,6 +32,7 @@ KELLY_FRACTION             = 0.3     # fractional Kelly multiplier (1.0 = full K
 MIN_EDGE                   = 0.005     # min probability edge required to place a bet
 MAX_POSITION               = 0.15     # max fraction of bankroll on any single bet
 MAX_EDGE                   = 0.2     # edges above this are skipped as near-expiry/vol artifacts
+MAX_PAYOUT                 = 0.5     # max potential win as a fraction of bankroll (caps long-shot bets)
 CORR_THRESHOLD             = 0.75     # correlation above which penalty is applied
 MIN_STAKE_USD              = 1.0      # minimum bet size in dollars
 

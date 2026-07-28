@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import (
     BACKTEST_LIMIT, LOOKBACK_DAYS, PRICING_OFFSET_MEAN_DAYS, PRICING_OFFSET_SIGMA_LN,
     MIN_T_DAYS, MAX_T_DAYS, BANKROLL, SAVE_PLOTS, MC_PATHS,
-    KELLY_FRACTION, MIN_EDGE, MAX_EDGE, MAX_POSITION,
+    KELLY_FRACTION, MIN_EDGE, MAX_EDGE, MAX_POSITION, MAX_PAYOUT,
 )
 from data.fetch_crypto import build_crypto_dataset, build_dvol_cache, get_implied_vol
 from data.fetch_polymarket import _resolve_expiry, fetch_resolved_markets, fetch_all_market_probs
@@ -288,6 +288,7 @@ def run_backtest(
         min_edge=MIN_EDGE,
         max_edge=MAX_EDGE,
         max_position=MAX_POSITION,
+        max_payout=MAX_PAYOUT,
     ).reset_index(drop=True)
 
     # Merge results

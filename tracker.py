@@ -70,41 +70,15 @@ def record_bet(signal, yes_token: str = "") -> dict:
 
 # ── Resolution checking ───────────────────────────────────────────────────────
 
-def _extract_yes_price(m: dict) -> float | None:
-    """Pull YES price from a Gamma API market dict using multiple fallback methods."""
-    for t in m.get("tokens", []):
-        if t.get("outcome", "").upper() == "YES":
-            try:
-                return float(t["price"])
-            except (KeyError, ValueError, TypeError):
-                pass
-    op = m.get("outcomePrices")
-    oc = m.get("outcomes")
-    if op and oc:
-        try:
-            prices   = json.loads(op) if isinstance(op, str) else op
-            outcomes = json.loads(oc) if isinstance(oc, str) else oc
-            for label, price in zip(outcomes, prices):
-                if str(label).upper() == "YES":
-                    return float(price)
-        except Exception:
-            pass
-    bid = m.get("bestBid")
-    ask = m.get("bestAsk")
-    if bid is not None and ask is not None:
-        return (float(bid) + float(ask)) / 2
-    return None
-
 
 def _check_resolution(condition_id: str, expiry: str = "") -> tuple[bool, str | None]:
     """
     Returns (is_resolved, outcome) where outcome is "YES", "NO", or None.
-    Before expiry: only the API's resolved flag is trusted (avoids settling on
-    a high market price that could still reverse before the event date).
-    After expiry: price check (>=0.95 / <=0.05) is used as a fallback when the
-    API's resolved flag isn't set.
+    Uses the CLOB API which supports exact lookup by condition_id.
+    Before expiry: only accepts a definitive winner token.
+    After expiry: also accepts a price near 0/1 as a fallback.
     """
-    GAMMA = "https://gamma-api.polymarket.com"
+    CLOB = "https://clob.polymarket.com"
 
     past_expiry = False
     if expiry:
@@ -114,31 +88,30 @@ def _check_resolution(condition_id: str, expiry: str = "") -> tuple[bool, str | 
         except Exception:
             pass
 
-    for param_key in ("conditionId", "id"):
-        try:
-            resp = requests.get(
-                f"{GAMMA}/markets",
-                params={param_key: condition_id, "limit": 1},
-                timeout=15,
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                markets = data if isinstance(data, list) else data.get("markets", [])
-                if markets:
-                    m = markets[0]
-                    if m.get("resolved"):
-                        result = str(m.get("result", "")).upper()
-                        if result in ("YES", "NO"):
-                            return True, result
-                    if past_expiry:
-                        yes_p = _extract_yes_price(m)
-                        if yes_p is not None:
-                            if yes_p >= 0.95:
-                                return True, "YES"
-                            if yes_p <= 0.05:
-                                return True, "NO"
-        except Exception as e:
-            logger.debug(f"Gamma resolution check failed ({param_key}={condition_id[:20]}): {e}")
+    try:
+        resp = requests.get(f"{CLOB}/markets/{condition_id}", timeout=15)
+        if resp.status_code == 200:
+            m = resp.json()
+            tokens = m.get("tokens", [])
+
+            # Primary: explicit winner flag set by Polymarket
+            winner = next((t["outcome"] for t in tokens if t.get("winner")), None)
+            if winner:
+                result = winner.upper()
+                if result in ("YES", "NO"):
+                    return True, result
+
+            # Post-expiry fallback: price pinned near 0 or 1
+            if past_expiry:
+                for t in tokens:
+                    if t.get("outcome", "").upper() == "YES":
+                        price = float(t.get("price", 0.5))
+                        if price >= 0.95:
+                            return True, "YES"
+                        if price <= 0.05:
+                            return True, "NO"
+    except Exception as e:
+        logger.debug(f"CLOB resolution check failed for {condition_id[:20]}: {e}")
 
     return False, None
 
@@ -149,7 +122,7 @@ def check_resolutions() -> list[dict]:
     Returns a list of newly resolved trade dicts.
     """
     data = _load()
-    open_trades = [t for t in data["trades"] if t["status"] == "OPEN"]
+    open_trades = [t for t in data["trades"] if t["status"] in ("OPEN", "UNRESOLVED")]
     if not open_trades:
         return []
 
@@ -164,12 +137,14 @@ def check_resolutions() -> list[dict]:
             continue
 
         if not is_resolved:
-            # Auto-close any bet whose expiry has already passed
+            # Auto-close only after a 3-day grace period past expiry
+            # (Polymarket often takes 1-3 days to officially resolve markets)
             expiry_str = trade.get("expiry", "")
-            if expiry_str:
+            if expiry_str and trade["status"] == "OPEN":
                 try:
                     exp_dt = datetime.fromisoformat(expiry_str.replace("Z", "+00:00"))
-                    if datetime.now(timezone.utc) >= exp_dt:
+                    grace  = exp_dt + timedelta(days=3)
+                    if datetime.now(timezone.utc) >= grace:
                         trade["status"]        = "UNRESOLVED"
                         trade["outcome"]       = None
                         trade["pnl"]           = 0.0
@@ -195,10 +170,23 @@ def check_resolutions() -> list[dict]:
         else:
             pnl = -stake
 
+        # Use expiry date as settlement date when the bet is already past expiry,
+        # so the equity curve reflects when the outcome was actually determined.
+        expiry_str = trade.get("expiry", "")
+        if expiry_str:
+            try:
+                exp_date = datetime.fromisoformat(expiry_str.replace("Z", "+00:00")).date()
+                settlement = min(exp_date, datetime.now(timezone.utc).date())
+                resolved_date = settlement.strftime("%Y-%m-%d")
+            except Exception:
+                resolved_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        else:
+            resolved_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
         trade["status"]        = "WON" if won else "LOST"
         trade["outcome"]       = resolved_outcome
         trade["pnl"]           = round(pnl, 2)
-        trade["date_resolved"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        trade["date_resolved"] = resolved_date
         newly_resolved.append(trade)
 
     _save(data)
