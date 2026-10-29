@@ -68,6 +68,63 @@ def record_bet(signal, yes_token: str = "") -> dict:
     return trade
 
 
+def entry_price(trade: dict) -> float:
+    """Price paid per share for the held side (market_prob is always the YES price)."""
+    return trade["market_prob"] if trade["side"] == "YES" else 1 - trade["market_prob"]
+
+
+def record_sell(trade_id: str, fraction: float, price: float) -> dict:
+    """
+    Sell `fraction` of an open position at `price` per share.
+
+    A full sell closes the trade as SOLD. A partial sell splits it: a new SOLD
+    record holds the sold slice (with its realised P&L) and the original trade
+    stays OPEN with its stake reduced. `original_stake_usd` keeps the first stake.
+    Returns the SOLD record.
+    """
+    data  = _load()
+    trade = next(t for t in data["trades"] if t["id"] == trade_id and t["status"] == "OPEN")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    fraction  = min(max(fraction, 0.0), 1.0)
+    shares    = trade["stake_usd"] / entry_price(trade)
+    sold_cost = trade["stake_usd"] * fraction
+    proceeds  = shares * fraction * price
+
+    if fraction >= 0.999:
+        sold = trade
+    else:
+        trade.setdefault("original_stake_usd", trade["stake_usd"])
+        trade["stake_usd"] = round(trade["stake_usd"] - sold_cost, 2)
+        sold = {**trade, "id": str(uuid.uuid4())[:8], "parent_id": trade_id}
+        sold.pop("original_stake_usd", None)
+        data["trades"].append(sold)
+
+    sold["stake_usd"]     = round(sold_cost, 2)
+    sold["status"]        = "SOLD"
+    sold["outcome"]       = None
+    sold["exit_price"]    = round(price, 4)
+    sold["pnl"]           = round(proceeds - sold_cost, 2)
+    sold["date_resolved"] = today
+    _save(data)
+    return sold
+
+
+def fetch_side_prices(condition_id: str, side: str) -> tuple[float, float] | None:
+    """(mid, best bid) for the YES or NO token of a market, or None on failure."""
+    CLOB = "https://clob.polymarket.com"
+    try:
+        m = requests.get(f"{CLOB}/markets/{condition_id}", timeout=15).json()
+        token = next(t for t in m.get("tokens", []) if t.get("outcome", "").upper() == side)
+        mid = float(token["price"])
+        book = requests.get(f"{CLOB}/book", params={"token_id": token["token_id"]}, timeout=15).json()
+        bids = [float(o["price"]) for o in book.get("bids", [])]
+        return mid, (max(bids) if bids else 0.0)
+    except Exception as e:
+        logger.debug(f"Price fetch failed for {condition_id[:20]}: {e}")
+        return None
+
+
 # ── Resolution checking ───────────────────────────────────────────────────────
 
 
@@ -195,17 +252,19 @@ def check_resolutions() -> list[dict]:
 
 def get_portfolio_stats(trades: list[dict], starting_bankroll: float) -> dict:
     resolved     = [t for t in trades if t["status"] in ("WON", "LOST")]
+    sold         = [t for t in trades if t["status"] == "SOLD"]
+    closed       = resolved + sold   # everything with realised P&L
     open_trades  = [t for t in trades if t["status"] == "OPEN"]
     unresolved   = [t for t in trades if t["status"] == "UNRESOLVED"]
     wins         = [t for t in resolved if t["status"] == "WON"]
     losses       = [t for t in resolved if t["status"] == "LOST"]
-    total_pnl    = sum(t["pnl"] for t in resolved)
+    total_pnl    = sum(t["pnl"] for t in closed)
 
     # Annualised Sharpe: build daily equity curve, compute daily returns,
     # then Sharpe = (mean_daily - rf/365) / std_daily * sqrt(365)
     sharpe = None
     resolved_dated = sorted(
-        [t for t in resolved if t.get("date_resolved")],
+        [t for t in closed if t.get("date_resolved")],
         key=lambda t: t["date_resolved"],
     )
     if len(resolved_dated) >= 2:
@@ -244,6 +303,8 @@ def get_portfolio_stats(trades: list[dict], starting_bankroll: float) -> dict:
         "win_rate":          len(wins) / len(resolved) if resolved else 0.0,
         "total_bets":        len(trades),
         "resolved_bets":     len(resolved),
+        "sold_bets":         len(sold),
+        "sold_pnl":          sum(t["pnl"] for t in sold),
         "open_bets":         len(open_trades),
         "unresolved_bets":   len(unresolved),
         "wins":              len(wins),
@@ -270,6 +331,7 @@ _C = {
     "muted":           "7F8C8D",
     "unresolved_bg":   "D5D8DC",
     "unresolved_fg":   "5D6D7E",
+    "sold_bg":         "D6EAF8",
 }
 
 
@@ -380,6 +442,7 @@ def export_excel() -> Path:
             stats["win_rate"] if stats["resolved_bets"] else "—",
             '0.0%' if stats["resolved_bets"] else None)
     _metric("Wins / Losses",           f"{stats['wins']} / {stats['losses']}")
+    _metric("Sold Early (P&L)",        f"{stats['sold_bets']}  (${stats['sold_pnl']:+,.2f})")
     _metric("Total Bets Placed",       stats["total_bets"])
     _metric("Open Positions",          stats["open_bets"])
     _metric("Unresolved (expired)",    stats["unresolved_bets"])
@@ -399,7 +462,7 @@ def export_excel() -> Path:
 
     # Equity curve data table
     resolved_sorted = sorted(
-        [t for t in trades if t["status"] in ("WON", "LOST") and t.get("date_resolved")],
+        [t for t in trades if t["status"] in ("WON", "LOST", "SOLD") and t.get("date_resolved")],
         key=lambda t: t["date_resolved"],
     )
 
@@ -520,12 +583,18 @@ def export_excel() -> Path:
     ws2.row_dimensions[1].height = 26
     ws2.freeze_panes = "A2"
 
-    # Sort by expiry date descending — soonest/future expiry at top, oldest at bottom
-    all_sorted = sorted(
-        trades,
-        key=lambda t: t.get("expiry") or "",
-        reverse=True,
-    )
+    # Sort by expiry date descending — furthest-out expiry at top, oldest at bottom.
+    # Within an expiry: bets in the order placed, each partial sell's slices
+    # directly under the bet they were split from.
+    by_id = {t["id"]: t for t in trades}
+
+    def _sort_key(t):
+        root = by_id.get(t.get("parent_id"), t)
+        return (root.get("date_placed") or "", root.get("question") or "", root["id"],
+                "parent_id" in t, t.get("date_resolved") or "")
+
+    all_sorted = sorted(trades, key=_sort_key)
+    all_sorted.sort(key=lambda t: t.get("expiry") or "", reverse=True)   # stable
 
     # Build cumulative P&L map (keyed by trade id, value = running pnl after this trade)
     cumulative: dict[str, float] = {}
@@ -540,9 +609,9 @@ def export_excel() -> Path:
         status = trade["status"]
         pnl    = trade.get("pnl")
 
-        if status in ("WON", "LOST"):
+        if status in ("WON", "LOST", "SOLD"):
             net_val = starting_bankroll + cumulative.get(trade["id"], running)
-            row_bg  = _C["win_bg"] if status == "WON" else _C["loss_bg"]
+            row_bg  = {"WON": _C["win_bg"], "LOST": _C["loss_bg"], "SOLD": _C["sold_bg"]}[status]
         elif status == "UNRESOLVED":
             net_val = current_net
             row_bg  = _C["unresolved_bg"]
@@ -556,14 +625,14 @@ def export_excel() -> Path:
             trade.get("date_placed", ""),
             (trade.get("expiry") or "")[:10],
             trade.get("asset", ""),
-            trade.get("question", ""),
+            ("↳ " if "parent_id" in trade else "") + trade.get("question", ""),
             trade.get("side", ""),
             trade.get("market_prob"),
             model_prob if model_prob > 0 else None,
             trade.get("edge"),
             trade.get("stake_usd"),
             status,
-            trade.get("outcome") or "",
+            f"@ {trade['exit_price']:.3f}" if status == "SOLD" else (trade.get("outcome") or ""),
             pnl,
             net_val,
         ]

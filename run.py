@@ -3,12 +3,14 @@ run.py
 ------
 Single-run entry point. Run this whenever you want to:
   1. Check if any open bets have resolved
-  2. Scan for new opportunities and record confirmed bets
-  3. Refresh the Excel file
+  2. Re-price open positions and sell down any that break the portfolio limits
+  3. Scan for new opportunities and record confirmed bets
+  4. Refresh the Excel file
 
 Usage:
-  python run.py               # full run: check resolutions + scan + prompt
+  python run.py               # full run: check resolutions + rebalance + scan + prompt
   python run.py --check       # only check resolutions, skip scan
+  python run.py --rebalance   # check resolutions + sell down positions, skip scan
   python run.py --export      # only regenerate Excel from existing data
 """
 
@@ -24,8 +26,9 @@ logging.basicConfig(level=logging.WARNING)
 
 from tracker import (
     _load, _save, record_bet, check_resolutions, export_excel,
-    get_portfolio_stats, EXCEL_FILE, STARTING_BANKROLL,
+    get_portfolio_stats, record_sell, EXCEL_FILE, STARTING_BANKROLL,
 )
+from config import MIN_STAKE_USD
 
 DIVIDER = "-" * 62
 
@@ -59,18 +62,79 @@ def run_check():
     return resolved
 
 
-def run_scan(bankroll: float) -> list:
-    """Run one scan cycle and return BET-flagged signals."""
-    _section("Scanning Polymarket for opportunities")
-    print(f"  Bankroll available: ${bankroll:,.2f}")
-    print("  (This takes ~1–2 min while fetching prices & running models…)\n")
-
+def _make_trader(bankroll: float):
     from execution.trader import LiveTrader
 
     # Suppress any remaining INFO noise after the import sets up logging
     logging.getLogger().setLevel(logging.WARNING)
+    return LiveTrader(bankroll=bankroll, paper_trade=True)
 
-    trader  = LiveTrader(bankroll=bankroll, paper_trade=True)
+
+def _parse_choice(choice: str, n: int) -> list[int]:
+    """'all' / 'none' / '1 3' -> zero-based indices."""
+    if choice in ("none", ""):
+        return []
+    if choice == "all":
+        return list(range(n))
+    indices = []
+    for token in choice.split():
+        try:
+            idx = int(token) - 1
+            if 0 <= idx < n:
+                indices.append(idx)
+            else:
+                print(f"  Ignored out-of-range: {token}")
+        except ValueError:
+            print(f"  Ignored unrecognised input: {token}")
+    return indices
+
+
+def run_rebalance(trader, nav: float) -> None:
+    """Re-price open positions and offer sells that bring the book within limits."""
+    from execution.rebalance import plan_sells
+
+    _section("Re-pricing open positions")
+    data        = _load()
+    open_trades = [t for t in data["trades"] if t["status"] == "OPEN"]
+    if not open_trades:
+        print("  No open positions.")
+        return
+
+    print("  (Fetching prices & running models…)")
+    priced = trader.price_open_positions(open_trades)
+    orders = plan_sells(priced, open_trades, nav)
+    if not orders:
+        print("  All open positions within limits — nothing to sell.")
+        return
+
+    for i, o in enumerate(orders, 1):
+        t = o.trade
+        print(f"\n  [{i}]  {t['asset']}  |  {t['side']}  |  Sell {o.fraction:.0%} @ {o.price:.3f}  ->  "
+              f"${o.proceeds:.2f}  (P&L ${o.pnl:+.2f})")
+        print(f"       {t['question'][:65]}")
+        print(f"       Expires: {(t.get('expiry') or '')[:10]}   Why: {'; '.join(o.reasons)}")
+
+    print(f"\n  Selling all would free ${sum(o.proceeds for o in orders):.2f} "
+          f"(realised P&L ${sum(o.pnl for o in orders):+.2f}).")
+    print(f"  Enter numbers to sell (e.g. 1  or  1 3  or  all  or  none):")
+    chosen = [orders[i] for i in _parse_choice(input("  > ").strip().lower(), len(orders))]
+
+    if not chosen:
+        print("  No sells recorded this run.")
+        return
+    print()
+    for o in chosen:
+        sold = record_sell(o.trade["id"], o.fraction, o.price)
+        print(f"  Sold  [{sold['id']}]  {o.trade['asset']} {o.trade['side']}  "
+              f"{o.fraction:.0%} @ {o.price:.3f}  ->  ${o.proceeds:.2f}  (P&L ${sold['pnl']:+.2f})")
+
+
+def run_scan(trader) -> list:
+    """Run one scan cycle and return BET-flagged signals."""
+    _section("Scanning Polymarket for opportunities")
+    print(f"  Bankroll: ${trader.bankroll:,.2f}")
+    print("  (This takes ~1–2 min while fetching prices & running models…)\n")
+
     signals = trader.scan()
     bets    = [s for s in signals if s.action == "BET"]
 
@@ -78,18 +142,39 @@ def run_scan(bankroll: float) -> list:
     return bets
 
 
-def prompt_and_record(bets: list, bankroll: float) -> float:
+def prompt_and_record(bets: list, bankroll: float, nav: float) -> float:
     """Display opportunities, prompt for selection, record confirmed bets."""
+    from execution.rebalance import cap_new_stake
+
     if not bets:
         return bankroll
 
     # Drop any market already in an open position
     data = _load()
-    open_cids = {t["condition_id"] for t in data["trades"] if t["status"] == "OPEN"}
+    open_trades = [t for t in data["trades"] if t["status"] == "OPEN"]
+    open_cids = {t["condition_id"] for t in open_trades}
     already_open = [b for b in bets if b.condition_id in open_cids]
     bets = [b for b in bets if b.condition_id not in open_cids]
     if already_open:
         print(f"  Skipped {len(already_open)} opportunit{'y' if len(already_open) == 1 else 'ies'} already in open positions.")
+
+    # Shrink stakes to fit the exposure caps and cash, best edge first.
+    # Any subset of the bets shown below also fits.
+    bets.sort(key=lambda s: -abs(s.edge_bs))
+    sim_open, sim_cash, fitted = list(open_trades), bankroll, []
+    for sig in bets:
+        like  = {"asset": sig.asset, "expiry": sig.end_date or ""}
+        stake = cap_new_stake(sig.recommended_stake_usd, like, sim_open, nav, sim_cash)
+        if stake < MIN_STAKE_USD:
+            continue
+        sig.recommended_stake_usd = round(stake, 2)
+        sim_open.append({**like, "stake_usd": stake})
+        sim_cash -= stake
+        fitted.append(sig)
+    n_capped = len(bets) - len(fitted)
+    if n_capped:
+        print(f"  Skipped {n_capped} opportunit{'y' if n_capped == 1 else 'ies'} — no room under exposure caps / cash.")
+    bets = fitted
     if not bets:
         return bankroll
 
@@ -104,24 +189,7 @@ def prompt_and_record(bets: list, bankroll: float) -> float:
               f"Vol24h: ${sig.volume_24h:,.0f}")
 
     print(f"\n  Enter numbers to record (e.g. 1  or  1 3  or  all  or  none):")
-    choice = input("  > ").strip().lower()
-
-    if choice in ("none", ""):
-        to_bet = []
-    elif choice == "all":
-        to_bet = bets
-    else:
-        indices = []
-        for token in choice.split():
-            try:
-                idx = int(token) - 1
-                if 0 <= idx < len(bets):
-                    indices.append(idx)
-                else:
-                    print(f"  Ignored out-of-range: {token}")
-            except ValueError:
-                print(f"  Ignored unrecognised input: {token}")
-        to_bet = [bets[i] for i in indices]
+    to_bet = [bets[i] for i in _parse_choice(input("  > ").strip().lower(), len(bets))]
 
     if not to_bet:
         print("  No bets recorded this run.")
@@ -146,8 +214,9 @@ def prompt_and_record(bets: list, bankroll: float) -> float:
 def main():
     _banner()
 
-    mode_check  = "--check"  in sys.argv
-    mode_export = "--export" in sys.argv
+    mode_check     = "--check"     in sys.argv
+    mode_export    = "--export"    in sys.argv
+    mode_rebalance = "--rebalance" in sys.argv
 
     # ── Load state ─────────────────────────────────────────────────────────────
     data             = _load()
@@ -180,14 +249,29 @@ def main():
         print(f"  Portfolio value: ${stats['net_value']:.2f}\n")
         return
 
-    # ── Step 2: Scan ───────────────────────────────────────────────────────────
+    # ── Step 2: Rebalance open positions ───────────────────────────────────────
+    trader = _make_trader(bankroll=stats["net_value"])
+    run_rebalance(trader, nav=stats["net_value"])
+
+    data  = _load()
+    stats = get_portfolio_stats(data["trades"], starting_broll)
+
+    if mode_rebalance:
+        path = export_excel()
+        print(f"\n  Excel updated ->{path}")
+        print(f"  Portfolio value: ${stats['net_value']:.2f}   "
+              f"Capital at risk: ${stats['at_risk']:.2f}\n")
+        return
+
+    # ── Step 3: Scan ───────────────────────────────────────────────────────────
     # Kelly sizes on total portfolio value (the correct wealth basis).
     # Available capital (liquid cash) is tracked separately for affordability checks.
+    trader.bankroll = stats["net_value"]
     available = max(stats["net_value"] - stats["at_risk"], 0)
-    bets      = run_scan(bankroll=stats["net_value"])
+    bets      = run_scan(trader)
 
-    # ── Step 3: Record bets ────────────────────────────────────────────────────
-    prompt_and_record(bets, bankroll=available)
+    # ── Step 4: Record bets ────────────────────────────────────────────────────
+    prompt_and_record(bets, bankroll=available, nav=stats["net_value"])
 
     # ── Final: Export Excel ────────────────────────────────────────────────────
     _section("Exporting Excel")

@@ -21,10 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import pandas as pd
 from sizing.kelly import DEFAULT_MIN_EDGE, DEFAULT_KELLY_FRACTION, DEFAULT_MAX_POSITION, DEFAULT_MAX_PAYOUT
-try:
-    from config import MIN_STAKE_USD
-except ImportError:
-    MIN_STAKE_USD = 1.0
+from config import MIN_STAKE_USD, LIVE_MAX_T_DAYS, MAX_ENTRY_PRICE
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -40,7 +37,7 @@ MIN_VOLUME_TOTAL        = 2_000       # minimum total lifetime volume (USDC) to 
 # Contracts with total volume >= this are treated as "established" and skip the 24h floor
 ESTABLISHED_VOLUME      = 50_000
 
-MAX_T_YEARS             = 180 / 365  # reject markets expiring more than 6 months out
+MAX_T_YEARS             = LIVE_MAX_T_DAYS / 365  # reject markets expiring further out
 
 
 @dataclass
@@ -167,17 +164,143 @@ class LiveTrader:
 
         return T
 
+    def _prepare_market_data(self) -> bool:
+        """
+        Fetch crypto prices, calibrate jump params, correlation penalties and
+        Deribit DVOL. Cached on the instance so scan() and price_open_positions()
+        share one fetch. Returns False if the crypto fetch failed.
+        """
+        if getattr(self, "_crypto_data", None) is not None:
+            return True
+
+        try:
+            crypto_data = self._fetch_crypto(lookback_days=120)
+        except Exception as e:
+            logger.error(f"Crypto data fetch failed: {e}")
+            return False
+
+        log_returns = {
+            asset: df["log_return"].dropna()
+            for asset, df in crypto_data.items()
+            if "log_return" in df.columns
+        }
+
+        # Calibrate jump params per asset from recent log returns
+        for asset, ret_series in log_returns.items():
+            try:
+                self._jump_params[asset] = self._calibrate_jump_params(ret_series.values)
+            except Exception as e:
+                logger.warning(f"Jump param calibration failed for {asset}: {e}. Using default.")
+                from pricing.monte_carlo import DEFAULT_JUMP_PARAMS
+                self._jump_params[asset] = DEFAULT_JUMP_PARAMS
+
+        try:
+            corr_matrix = self._get_corr_matrix(log_returns, window=30)
+            penalties = self._corr_penalty(corr_matrix)
+        except Exception as e:
+            logger.warning(f"Correlation calc failed: {e}. Using no penalty.")
+            penalties = {}
+
+        # Deribit DVOL for BTC/ETH
+        dvol_sigmas: dict[str, float] = {}
+        for asset in self._dvol_assets:
+            dvol = self._get_current_dvol(asset)
+            if dvol is not None:
+                dvol_sigmas[asset] = dvol
+                logger.info(f"  Deribit DVOL {asset}: {dvol:.1%}")
+
+        self._crypto_data = crypto_data
+        self._penalties   = penalties
+        self._dvol_sigmas = dvol_sigmas
+        return True
+
+    def _spot_and_sigma(self, asset: str) -> tuple[float, float] | None:
+        """Latest spot price and vol (DVOL if available, else 30d realised)."""
+        asset_df = self._crypto_data.get(asset)
+        if asset_df is None or asset_df.empty:
+            return None
+        S = float(asset_df["Close"].iloc[-1])
+        hist_sigma = float(asset_df["realised_vol_30d"].dropna().iloc[-1])
+        return S, self._dvol_sigmas.get(asset, hist_sigma)
+
+    def _model_probs(self, asset: str, S: float, K: float, T: float,
+                     sigma: float, is_put: bool) -> tuple[float, float]:
+        """(BS, MC) probability that YES resolves."""
+        bs_call = self._bs.price(S, K, T, sigma)
+        jp      = self._jump_params.get(asset)
+        mc_out  = self._mc.price(S, K, T, sigma, jp) if jp else self._mc.price(S, K, T, sigma)
+        mc_call = mc_out["price"]
+        # Flip to put probability if the question is about downside
+        bs_p = (1.0 - bs_call) if is_put else bs_call
+        mc_p = (1.0 - mc_call) if is_put else mc_call
+        return bs_p, mc_p
+
+    def price_open_positions(self, trades: list[dict]) -> list[dict]:
+        """
+        Re-price open trades with today's model and live order book.
+        Returns one dict per priceable trade with the model probability for the
+        held side, the current mid and best bid, and the fresh Kelly target ($).
+        """
+        from tracker import fetch_side_prices
+
+        if not self._prepare_market_data():
+            return []
+
+        today = datetime.now(timezone.utc).date()
+        out = []
+        for t in trades:
+            ss = self._spot_and_sigma(t["asset"])
+            K  = t.get("strike")
+            try:
+                expiry = datetime.fromisoformat(t["expiry"].replace("Z", "+00:00")).date()
+            except Exception:
+                continue
+            days = (expiry - today).days
+            if ss is None or not K or days < 1:
+                continue
+            S, sigma = ss
+
+            prices = fetch_side_prices(t["condition_id"], t["side"])
+            if prices is None:
+                continue
+            mid, bid = prices
+
+            bs_p, mc_p = self._model_probs(t["asset"], S, K, days / 365.0, sigma,
+                                           t.get("option_type") == "put")
+            p_yes  = float(np.clip((bs_p + mc_p) / 2, 1e-6, 1 - 1e-6))
+            p_side = p_yes if t["side"] == "YES" else 1.0 - p_yes
+            mid_c  = float(np.clip(mid, 1e-6, 1 - 1e-6))
+
+            sizing = self._size_bet(
+                asset=t["asset"],
+                model_prob=p_side,
+                market_prob=mid_c,
+                corr_penalty=self._penalties.get(t["asset"], 1.0),
+                kelly_fraction=self.kelly_fraction,
+                min_edge=self.min_edge,
+                max_position=self.max_position,
+                max_payout=self.max_payout,
+            )
+            target = sizing.final_stake * self.bankroll if sizing.should_bet else 0.0
+
+            out.append({
+                "trade":      t,
+                "model_prob": p_side,
+                "mid":        mid,
+                "bid":        bid,
+                "kelly_target_usd": target,
+            })
+        return out
+
     def scan(self) -> list[TradeSignal]:
         """Run one full scan cycle. Returns list of trade signals."""
         logger.info("=" * 60)
         logger.info(f"Starting scan at {datetime.now().isoformat()}")
 
-        # ── 1. Fetch crypto price data ─────────────────────────────────
-        try:
-            crypto_data = self._fetch_crypto(lookback_days=120)
-        except Exception as e:
-            logger.error(f"Crypto data fetch failed: {e}")
+        # ── 1. Crypto prices, jump params, correlation, DVOL ───────────
+        if not self._prepare_market_data():
             return []
+        penalties = self._penalties
 
         # ── 2. Fetch + filter Polymarket contracts ─────────────────────
         try:
@@ -196,51 +319,18 @@ class LiveTrader:
             f"or total≥${ESTABLISHED_VOLUME:,.0f})"
         )
 
-        # ── 3. Correlation matrix ──────────────────────────────────────
-        log_returns = {
-            asset: df["log_return"].dropna()
-            for asset, df in crypto_data.items()
-            if "log_return" in df.columns
-        }
-
-        # ── 3a. Calibrate jump params per asset from recent log returns ───
-        for asset, ret_series in log_returns.items():
-            try:
-                self._jump_params[asset] = self._calibrate_jump_params(ret_series.values)
-            except Exception as e:
-                logger.warning(f"Jump param calibration failed for {asset}: {e}. Using default.")
-                from pricing.monte_carlo import DEFAULT_JUMP_PARAMS
-                self._jump_params[asset] = DEFAULT_JUMP_PARAMS
-
-        try:
-            corr_matrix = self._get_corr_matrix(log_returns, window=30)
-            penalties = self._corr_penalty(corr_matrix)
-        except Exception as e:
-            logger.warning(f"Correlation calc failed: {e}. Using no penalty.")
-            penalties = {}
-
-        # ── 3b. Fetch Deribit DVOL for BTC/ETH ────────────────────────
-        dvol_sigmas: dict[str, float] = {}
-        for asset in self._dvol_assets:
-            dvol = self._get_current_dvol(asset)
-            if dvol is not None:
-                dvol_sigmas[asset] = dvol
-                logger.info(f"  Deribit DVOL {asset}: {dvol:.1%}")
-
-        # ── 4. Price each market ───────────────────────────────────────
+        # ── 3. Price each market ───────────────────────────────────────
         signals: list[TradeSignal] = []
 
         for market in liquid_markets:
-            asset_df = crypto_data.get(market.asset)
-            if asset_df is None or asset_df.empty:
+            ss = self._spot_and_sigma(market.asset)
+            if ss is None:
                 logger.debug(f"No crypto data for asset '{market.asset}' — skipping.")
                 continue
 
-            S      = float(asset_df["Close"].iloc[-1])
+            S, sigma = ss
             K      = market.strike
             T      = self._time_to_expiry(market)
-            hist_sigma = float(asset_df["realised_vol_30d"].dropna().iloc[-1])
-            sigma  = dvol_sigmas.get(market.asset, hist_sigma)
             market_prob = market.implied_prob   # yes_price from PolymarketContract
 
             if K is None or T is None or K <= 0 or S <= 0 or sigma <= 0:
@@ -254,17 +344,10 @@ class LiveTrader:
             is_put = market.option_type == "put"
 
             try:
-                bs_call = self._bs.price(S, K, T, sigma)
-                jp      = self._jump_params.get(market.asset)
-                mc_out  = self._mc.price(S, K, T, sigma, jp) if jp else self._mc.price(S, K, T, sigma)
-                mc_call = mc_out["price"]
+                bs_p, mc_p = self._model_probs(market.asset, S, K, T, sigma, is_put)
             except Exception as e:
                 logger.warning(f"Pricing error for {market.condition_id}: {e}")
                 continue
-
-            # Flip to put probability if the question is about downside
-            bs_p = (1.0 - bs_call) if is_put else bs_call
-            mc_p = (1.0 - mc_call) if is_put else mc_call
 
             model_prob  = float(np.clip((bs_p + mc_p) / 2, 1e-6, 1 - 1e-6))
             market_prob = float(np.clip(market_prob, 1e-6, 1 - 1e-6))
@@ -295,8 +378,11 @@ class LiveTrader:
                 max_payout=self.max_payout,
             )
 
+            # Expensive tokens risk a lot to win very little — skip them
+            should_bet = sizing.should_bet and adj_market_prob <= MAX_ENTRY_PRICE
+
             stake_usd = sizing.final_stake * self.bankroll
-            if sizing.should_bet:
+            if should_bet:
                 stake_usd = max(stake_usd, MIN_STAKE_USD)
 
             signal = TradeSignal(
@@ -318,7 +404,7 @@ class LiveTrader:
                 option_type=market.option_type,
                 side=bet_side,
                 yes_token=self._parse_yes_token(market.token_ids) or "",
-                action="BET" if sizing.should_bet else "SKIP",
+                action="BET" if should_bet else "SKIP",
             )
             signals.append(signal)
 
