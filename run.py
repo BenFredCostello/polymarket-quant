@@ -93,7 +93,11 @@ def _push_excel(path) -> None:
 
 def _export() -> str:
     """Regenerate the Excel and push it to GitHub."""
-    path = export_excel()
+    try:
+        path = export_excel()
+    except PermissionError:
+        print("  (Excel is open — close it and run `python run.py --export` to refresh)")
+        return None
     if path:
         _push_excel(path)
     return path
@@ -269,7 +273,7 @@ def main():
 
     if mode_export:
         path = _export()
-        print(f"\n  Excel refreshed -> {path}\n")
+        if path: print(f"\n  Excel refreshed -> {path}\n")
         return
 
     # ── Step 1: Check resolutions ──────────────────────────────────────────────
@@ -282,7 +286,7 @@ def main():
 
     if mode_check:
         path = _export()
-        print(f"\n  Excel updated ->{path}")
+        if path: print(f"\n  Excel updated ->{path}")
         print(f"  Portfolio value: ${stats['net_value']:.2f}\n")
         return
 
@@ -295,7 +299,7 @@ def main():
 
     if mode_rebalance:
         path = _export()
-        print(f"\n  Excel updated ->{path}")
+        if path: print(f"\n  Excel updated ->{path}")
         print(f"  Portfolio value: ${stats['net_value']:.2f}   "
               f"Capital at risk: ${stats['at_risk']:.2f}\n")
         return
@@ -313,7 +317,7 @@ def main():
     # ── Final: Export Excel ────────────────────────────────────────────────────
     _section("Exporting Excel")
     path = _export()
-    print(f"  Saved ->{path}")
+    if path: print(f"  Saved ->{path}")
 
     data   = _load()
     stats  = get_portfolio_stats(data["trades"], starting_broll)

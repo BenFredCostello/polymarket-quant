@@ -8,10 +8,13 @@ LiveTrader.price_open_positions(), sells are recorded by tracker.record_sell().
 Rules, applied in order to a per-trade "keep fraction" (starts at 1.0):
   1. Edge gone      — model prob minus best bid below EXIT_EDGE → sell all
   2. Little upside  — token mid above MAX_ENTRY_PRICE → sell all
-  3. Kelly trim     — position value above today's Kelly target → trim to target
-  4. Group cap      — one asset + expiry above MAX_GROUP_EXPOSURE → scale down
-  5. Total cap      — all open positions above MAX_TOTAL_EXPOSURE → scale down
+  3. Group cap      — one asset + expiry above MAX_GROUP_EXPOSURE → scale down
+  4. Total cap      — all open positions above MAX_TOTAL_EXPOSURE → scale down
 Caps are measured on cost basis (stake_usd), the same basis as "capital at risk".
+There is deliberately no trim-to-Kelly rule: the target swings ~2x on small
+model moves, so it would sell a slice of everything every day.
+Trades inside their last LIVE_MIN_T_DAYS arrive unpriced: they count toward
+the caps but are never sold.
 """
 
 import os
@@ -55,19 +58,14 @@ def plan_sells(priced: list[dict], open_trades: list[dict], nav: float) -> list[
     info    = {p["trade"]["id"]: p for p in priced if p["bid"] > 0}
     reasons = {tid: [] for tid in keep}
 
-    # 1–3. Per-position rules
+    # 1–2. Per-position rules
     for tid, p in info.items():
-        t = p["trade"]
-        value = t["stake_usd"] / entry_price(t) * p["mid"]
         if p["model_prob"] - p["bid"] < EXIT_EDGE:
             keep[tid] = 0.0
             reasons[tid].append(f"edge gone (model {p['model_prob']:.1%} vs bid {p['bid']:.1%})")
         elif p["mid"] > MAX_ENTRY_PRICE:
             keep[tid] = 0.0
             reasons[tid].append(f"little upside left (price {p['mid']:.3f})")
-        elif value > p["kelly_target_usd"]:
-            keep[tid] = p["kelly_target_usd"] / value
-            reasons[tid].append(f"above Kelly target (${value:.0f} -> ${p['kelly_target_usd']:.0f})")
 
     def _scale_to_cap(trades: list[dict], cap_usd: float, label: str) -> None:
         fixed   = sum(t["stake_usd"] for t in trades if t["id"] not in keep)
@@ -80,7 +78,7 @@ def plan_sells(priced: list[dict], open_trades: list[dict], nav: float) -> list[
                 keep[t["id"]] *= s
                 reasons[t["id"]].append(label)
 
-    # 4. Group caps
+    # 3. Group caps
     groups: dict[tuple, list[dict]] = {}
     for t in open_trades:
         groups.setdefault(group_key(t), []).append(t)
@@ -88,7 +86,7 @@ def plan_sells(priced: list[dict], open_trades: list[dict], nav: float) -> list[
         _scale_to_cap(trades, MAX_GROUP_EXPOSURE * nav,
                       f"{asset} {expiry} group over {MAX_GROUP_EXPOSURE:.0%} cap")
 
-    # 5. Total cap
+    # 4. Total cap
     _scale_to_cap(open_trades, MAX_TOTAL_EXPOSURE * nav,
                   f"total exposure over {MAX_TOTAL_EXPOSURE:.0%} cap")
 

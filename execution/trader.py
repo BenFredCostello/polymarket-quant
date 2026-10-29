@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import pandas as pd
 from sizing.kelly import DEFAULT_MIN_EDGE, DEFAULT_KELLY_FRACTION, DEFAULT_MAX_POSITION, DEFAULT_MAX_PAYOUT
-from config import MIN_STAKE_USD, LIVE_MAX_T_DAYS, MAX_ENTRY_PRICE
+from config import MIN_STAKE_USD, LIVE_MIN_T_DAYS, LIVE_MAX_T_DAYS, MAX_ENTRY_PRICE
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -155,8 +155,8 @@ class LiveTrader:
         today = datetime.now(timezone.utc).date()
         days_remaining = (expiry - today).days
 
-        if days_remaining < 1:
-            return None   # already expired or resolves today
+        if days_remaining < LIVE_MIN_T_DAYS:
+            return None   # near-expiry edges are artifacts (see backtest MIN_T_DAYS)
 
         T = days_remaining / 365.0
         if T > MAX_T_YEARS:
@@ -239,7 +239,8 @@ class LiveTrader:
         """
         Re-price open trades with today's model and live order book.
         Returns one dict per priceable trade with the model probability for the
-        held side, the current mid and best bid, and the fresh Kelly target ($).
+        held side and the current mid and best bid. Trades inside the last
+        LIVE_MIN_T_DAYS are skipped — left to settle, never sold.
         """
         from tracker import fetch_side_prices
 
@@ -256,7 +257,7 @@ class LiveTrader:
             except Exception:
                 continue
             days = (expiry - today).days
-            if ss is None or not K or days < 1:
+            if ss is None or not K or days < LIVE_MIN_T_DAYS:
                 continue
             S, sigma = ss
 
@@ -269,26 +270,12 @@ class LiveTrader:
                                            t.get("option_type") == "put")
             p_yes  = float(np.clip((bs_p + mc_p) / 2, 1e-6, 1 - 1e-6))
             p_side = p_yes if t["side"] == "YES" else 1.0 - p_yes
-            mid_c  = float(np.clip(mid, 1e-6, 1 - 1e-6))
-
-            sizing = self._size_bet(
-                asset=t["asset"],
-                model_prob=p_side,
-                market_prob=mid_c,
-                corr_penalty=self._penalties.get(t["asset"], 1.0),
-                kelly_fraction=self.kelly_fraction,
-                min_edge=self.min_edge,
-                max_position=self.max_position,
-                max_payout=self.max_payout,
-            )
-            target = sizing.final_stake * self.bankroll if sizing.should_bet else 0.0
 
             out.append({
                 "trade":      t,
                 "model_prob": p_side,
                 "mid":        mid,
                 "bid":        bid,
-                "kelly_target_usd": target,
             })
         return out
 

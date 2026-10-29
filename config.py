@@ -39,10 +39,13 @@ MIN_STAKE_USD              = 1.0      # minimum bet size in dollars
 # ── live portfolio limits ─────────────────────────────────────────────────────
 MAX_TOTAL_EXPOSURE         = 0.75     # max fraction of portfolio in open positions (cost basis); rest stays cash
 MAX_GROUP_EXPOSURE         = 0.4     # max fraction on one asset + expiry date (those bets all move together)
+LIVE_MIN_T_DAYS            = 7        # live scanner skips markets expiring sooner (matches backtest MIN_T_DAYS);
+                                      # open positions inside this window are left to settle, never sold
 LIVE_MAX_T_DAYS            = 45       # live scanner skips markets expiring further out (keeps capital turning over)
 MAX_ENTRY_PRICE            = 0.95     # skip tokens priced above this (risking a lot to win very little)
-EXIT_EDGE                  = 0.0      # sell an open position once model prob - bid falls below this
-MIN_SELL_USD               = 5.0      # ignore trims smaller than this (avoids churn)
+EXIT_EDGE                  = -0.03    # sell an open position once model prob - bid falls below this
+                                      # (negative = bid must beat the model by a margin, so we don't pay the spread for noise)
+MIN_SELL_USD               = 5.0      # ignore cap trims smaller than this (avoids churn)
 
 # ── monte_carlo / jump diffusion ──────────────────────────────────────────────
 JUMP_LAM                   = 8.0      # jump intensity (jumps per year)
