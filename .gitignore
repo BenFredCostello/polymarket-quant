@@ -11,3 +11,4 @@
 # Un-ignore project files
 !README.md
 !.gitignore
+!polymarket_trades.xlsx

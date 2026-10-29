@@ -17,6 +17,8 @@ Usage:
 import os
 import sys
 import logging
+import subprocess
+from datetime import datetime
 
 # Project root on path before any local imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -60,6 +62,41 @@ def run_check():
             print(f"          P&L: ${t['pnl']:+.2f}   resolved ->{t['outcome']}")
 
     return resolved
+
+
+def _push_excel(path) -> None:
+    """Commit just the Excel file and push it. Never fails the run."""
+    repo = os.path.dirname(os.path.abspath(__file__))
+    name = os.path.basename(path)
+
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True)
+
+    try:
+        git("add", "--", name)
+        if git("diff", "--cached", "--quiet", "--", name).returncode == 0:
+            return   # unchanged
+        msg = f"Update trades Excel {datetime.now():%Y-%m-%d %H:%M}"
+        # Commit only this path so anything else staged is left alone
+        r = git("commit", "-m", msg, "--", name)
+        if r.returncode != 0:
+            print(f"  (Excel not committed: {(r.stderr or r.stdout).strip()[:200]})")
+            return
+        r = git("push")
+        if r.returncode != 0:
+            print(f"  (Excel committed but push failed: {r.stderr.strip()[:200]})")
+        else:
+            print("  Excel pushed to GitHub.")
+    except FileNotFoundError:
+        print("  (git not found — Excel not pushed)")
+
+
+def _export() -> str:
+    """Regenerate the Excel and push it to GitHub."""
+    path = export_excel()
+    if path:
+        _push_excel(path)
+    return path
 
 
 def _make_trader(bankroll: float):
@@ -231,7 +268,7 @@ def main():
           f"\n  Portfolio: ${stats['net_value']:.2f}  |  No resolved bets yet.")
 
     if mode_export:
-        path = export_excel()
+        path = _export()
         print(f"\n  Excel refreshed -> {path}\n")
         return
 
@@ -244,7 +281,7 @@ def main():
     stats  = get_portfolio_stats(trades, starting_broll)
 
     if mode_check:
-        path = export_excel()
+        path = _export()
         print(f"\n  Excel updated ->{path}")
         print(f"  Portfolio value: ${stats['net_value']:.2f}\n")
         return
@@ -257,7 +294,7 @@ def main():
     stats = get_portfolio_stats(data["trades"], starting_broll)
 
     if mode_rebalance:
-        path = export_excel()
+        path = _export()
         print(f"\n  Excel updated ->{path}")
         print(f"  Portfolio value: ${stats['net_value']:.2f}   "
               f"Capital at risk: ${stats['at_risk']:.2f}\n")
@@ -275,7 +312,7 @@ def main():
 
     # ── Final: Export Excel ────────────────────────────────────────────────────
     _section("Exporting Excel")
-    path = export_excel()
+    path = _export()
     print(f"  Saved ->{path}")
 
     data   = _load()
