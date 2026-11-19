@@ -8,10 +8,11 @@ Single-run entry point. Run this whenever you want to:
   4. Refresh the Excel file
 
 Usage:
-  python run.py               # full run: check resolutions + rebalance + scan + prompt
+  python run.py               # full run: check resolutions + rebalance + scan + record
   python run.py --check       # only check resolutions, skip scan
   python run.py --rebalance   # check resolutions + sell down positions, skip scan
   python run.py --export      # only regenerate Excel from existing data
+  python run.py --ask         # pick sells/bets by hand this run (when AUTO_CONFIRM is on)
 """
 
 import os
@@ -30,7 +31,7 @@ from tracker import (
     _load, _save, record_bet, check_resolutions, export_excel,
     get_portfolio_stats, record_sell, EXCEL_FILE, STARTING_BANKROLL,
 )
-from config import MIN_STAKE_USD
+from config import MIN_STAKE_USD, AUTO_CONFIRM
 
 DIVIDER = "-" * 62
 
@@ -111,6 +112,15 @@ def _make_trader(bankroll: float):
     return LiveTrader(bankroll=bankroll, paper_trade=True)
 
 
+def _choose(n: int, verb: str) -> list[int]:
+    """Take everything when AUTO_CONFIRM is on (unless --ask), else prompt."""
+    if AUTO_CONFIRM and "--ask" not in sys.argv:
+        print(f"\n  Auto-confirm: {verb} all {n}.")
+        return list(range(n))
+    print(f"\n  Enter numbers to {verb} (e.g. 1  or  1 3  or  all  or  none):")
+    return _parse_choice(input("  > ").strip().lower(), n)
+
+
 def _parse_choice(choice: str, n: int) -> list[int]:
     """'all' / 'none' / '1 3' -> zero-based indices."""
     if choice in ("none", ""):
@@ -157,8 +167,7 @@ def run_rebalance(trader, nav: float) -> None:
 
     print(f"\n  Selling all would free ${sum(o.proceeds for o in orders):.2f} "
           f"(realised P&L ${sum(o.pnl for o in orders):+.2f}).")
-    print(f"  Enter numbers to sell (e.g. 1  or  1 3  or  all  or  none):")
-    chosen = [orders[i] for i in _parse_choice(input("  > ").strip().lower(), len(orders))]
+    chosen = [orders[i] for i in _choose(len(orders), "sell")]
 
     if not chosen:
         print("  No sells recorded this run.")
@@ -229,8 +238,7 @@ def prompt_and_record(bets: list, bankroll: float, nav: float) -> float:
               f"Expires: {(sig.end_date or '')[:10]}   "
               f"Vol24h: ${sig.volume_24h:,.0f}")
 
-    print(f"\n  Enter numbers to record (e.g. 1  or  1 3  or  all  or  none):")
-    to_bet = [bets[i] for i in _parse_choice(input("  > ").strip().lower(), len(bets))]
+    to_bet = [bets[i] for i in _choose(len(bets), "record")]
 
     if not to_bet:
         print("  No bets recorded this run.")

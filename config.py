@@ -46,6 +46,7 @@ MAX_ENTRY_PRICE            = 0.95     # skip tokens priced above this (risking a
 EXIT_EDGE                  = -0.03    # sell an open position once model prob - bid falls below this
                                       # (negative = bid must beat the model by a margin, so we don't pay the spread for noise)
 MIN_SELL_USD               = 5.0      # ignore cap trims smaller than this (avoids churn)
+AUTO_CONFIRM               = True     # run.py takes every proposed sell and bet without asking (--ask to pick by hand)
 
 # ── monte_carlo / jump diffusion ──────────────────────────────────────────────
 JUMP_LAM                   = 8.0      # jump intensity (jumps per year)
